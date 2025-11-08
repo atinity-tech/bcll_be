@@ -1,12 +1,13 @@
 from fastapi import APIRouter, HTTPException, Depends, status
 from typing import List, Dict, Any, Tuple
 from datetime import datetime, timedelta, time
-from app.db.models import RoutePlanRequest, ScheduleCreateRequest
+from app.db.models import RoutePlanRequest, ScheduleCreateRequest, MultiBusDeploymentRequest
 from app.db.mongodb import mongodb
 from app.utils.auth_utils import require_admin
 from app.routing.graph_builder import graph_builder
 from app.ai.gemini_route_optimizer import gemini_route_optimizer
 from app.ai.gemini_scheduler import gemini_scheduler
+from app.utils.schedule_generator import schedule_generator
 from pydantic import BaseModel
 import math
 
@@ -288,6 +289,14 @@ async def select_and_save_route(request: RouteSelectionRequest, current_user: Di
             }
             frequency_data = gemini_scheduler.predict_schedule(route_info, request.peak_hour)
 
+        # Generate intermediate stops with timing
+        waypoints_tuples = [(wp[0], wp[1]) for wp in request.waypoints]
+        intermediate_stops = schedule_generator.generate_intermediate_stops(
+            waypoints_tuples,
+            int(request.duration_min),
+            num_stops=8  # Generate 8 intermediate stops
+        )
+
         # Create route document
         route = {
             "route_id": route_id,
@@ -297,6 +306,7 @@ async def select_and_save_route(request: RouteSelectionRequest, current_user: Di
             "source_coords": {"lat": request.source_lat, "lng": request.source_lng},
             "dest_coords": {"lat": request.dest_lat, "lng": request.dest_lng},
             "waypoints": request.waypoints,
+            "intermediate_stops": intermediate_stops,  # NEW: Stops with timing
             "total_distance_km": request.distance_km,
             "estimated_duration_min": request.duration_min,
             "gemini_score": request.gemini_score,
@@ -532,22 +542,174 @@ async def get_all_schedules():
     }
 
 
+@router.post("/route/{route_id}/deploy-buses")
+async def deploy_multiple_buses(route_id: str, request: MultiBusDeploymentRequest):
+    """
+    Deploy multiple buses on a single route with staggered schedules
+    """
+    try:
+        routes_collection = mongodb.get_collection("routes")
+        schedules_collection = mongodb.get_collection("schedules")
+        bus_instances_collection = mongodb.get_collection("bus_instances")
+
+        # Get route details
+        route = routes_collection.find_one({"route_id": route_id})
+        if not route:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Route not found"
+            )
+
+        # Determine operating hours
+        if request.peak_hour == "morning":
+            start_time, end_time = "06:00", "22:00"
+        elif request.peak_hour == "evening":
+            start_time, end_time = "06:00", "22:00"
+        else:
+            start_time, end_time = "09:00", "20:00"
+
+        # Get intermediate stops
+        intermediate_stops = route.get("intermediate_stops", [])
+
+        # Generate schedules for multiple buses
+        bus_schedules = schedule_generator.generate_multi_bus_schedules(
+            route_id=route_id,
+            num_buses=request.num_buses,
+            frequency_min=request.frequency_min,
+            start_time=start_time,
+            end_time=end_time,
+            intermediate_stops=intermediate_stops
+        )
+
+        # Save bus instances and schedules
+        created_instances = []
+        created_schedules = []
+
+        for bus_schedule in bus_schedules:
+            # Create bus instance
+            bus_instance = {
+                "bus_instance_id": bus_schedule["bus_instance_id"],
+                "route_id": route_id,
+                "bus_number": f"{route_id}-{bus_schedule['deployment_sequence']}",
+                "bus_id": f"BUS-{route_id}-{bus_schedule['deployment_sequence']}",
+                "deployment_sequence": bus_schedule["deployment_sequence"],
+                "schedule_offset_min": bus_schedule["schedule_offset_min"],
+                "active": True,
+                "created_at": datetime.utcnow()
+            }
+
+            result = bus_instances_collection.insert_one(bus_instance)
+            bus_instance["_id"] = str(result.inserted_id)
+            created_instances.append(bus_instance)
+
+            # Create schedule
+            schedule = {
+                "route_id": route_id,
+                "bus_id": bus_instance["bus_id"],
+                "bus_instance_id": bus_schedule["bus_instance_id"],
+                "bus_number": bus_instance["bus_number"],
+                "peak_hour": request.peak_hour,
+                "start_time": start_time,
+                "end_time": end_time,
+                "frequency_min": request.frequency_min,
+                "suggested_buses_count": request.num_buses,
+                "departure_times": bus_schedule["departure_times"],
+                "stop_timings": bus_schedule["stop_timings"],
+                "deployment_sequence": bus_schedule["deployment_sequence"],
+                "active": True,
+                "created_at": datetime.utcnow()
+            }
+
+            result = schedules_collection.insert_one(schedule)
+            schedule["_id"] = str(result.inserted_id)
+            created_schedules.append(schedule)
+
+        return {
+            "message": f"Successfully deployed {request.num_buses} buses on route {route_id}",
+            "route_id": route_id,
+            "num_buses_deployed": request.num_buses,
+            "frequency_min": request.frequency_min,
+            "bus_instances": created_instances,
+            "schedules": created_schedules
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error deploying buses: {str(e)}"
+        )
+
+
+@router.get("/route/{route_id}/schedule-matrix")
+async def get_schedule_matrix(route_id: str):
+    """
+    Get time-location matrix for a route (metro/train style)
+    Shows all buses and their timing at each stop
+    """
+    try:
+        routes_collection = mongodb.get_collection("routes")
+        schedules_collection = mongodb.get_collection("schedules")
+
+        # Get route
+        route = routes_collection.find_one({"route_id": route_id})
+        if not route:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Route not found"
+            )
+
+        # Get all schedules for this route
+        schedules = list(schedules_collection.find({"route_id": route_id, "active": True}))
+
+        # Get intermediate stops
+        intermediate_stops = route.get("intermediate_stops", [])
+
+        # Build matrix
+        matrix = {
+            "route_id": route_id,
+            "route_name": route.get("name"),
+            "stops": intermediate_stops,
+            "buses": []
+        }
+
+        for schedule in schedules:
+            bus_info = {
+                "bus_number": schedule.get("bus_number"),
+                "bus_instance_id": schedule.get("bus_instance_id"),
+                "deployment_sequence": schedule.get("deployment_sequence", 1),
+                "departure_times": schedule.get("departure_times", []),
+                "stop_timings": schedule.get("stop_timings", [])
+            }
+            matrix["buses"].append(bus_info)
+
+        # Sort buses by deployment sequence
+        matrix["buses"].sort(key=lambda x: x.get("deployment_sequence", 999))
+
+        return matrix
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error getting schedule matrix: {str(e)}"
+        )
+
+
 @router.put("/route/{route_id}")
 async def update_route(route_id: str, route_data: Dict[Any, Any]):
     """Update a route"""
     routes_collection = mongodb.get_collection("routes")
-    
+
     result = routes_collection.update_one(
         {"route_id": route_id},
         {"$set": route_data}
     )
-    
+
     if result.matched_count == 0:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Route not found"
         )
-    
+
     return {
         "message": "Route updated successfully",
         "route_id": route_id
@@ -558,17 +720,137 @@ async def update_route(route_id: str, route_data: Dict[Any, Any]):
 async def delete_route(route_id: str):
     """Delete a route"""
     routes_collection = mongodb.get_collection("routes")
-    
+
     result = routes_collection.delete_one({"route_id": route_id})
-    
+
     if result.deleted_count == 0:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Route not found"
         )
-    
+
     return {
         "message": "Route deleted successfully",
         "route_id": route_id
+    }
+
+
+@router.post("/routes/{route_id}/update-place-names")
+async def update_route_place_names(route_id: str):
+    """
+    Update a specific route's intermediate stops with proper place names
+    This is useful for routes that were saved before the geocoding fix
+    """
+    routes_collection = mongodb.get_collection("routes")
+
+    # Get the route
+    route = routes_collection.find_one({"route_id": route_id})
+
+    if not route:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Route not found"
+        )
+
+    # Check if route has intermediate_stops
+    if "intermediate_stops" not in route or not route["intermediate_stops"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Route has no intermediate stops to update"
+        )
+
+    intermediate_stops = route["intermediate_stops"]
+    updated_stops = []
+    updates_made = 0
+
+    # Update each stop
+    for stop in intermediate_stops:
+        lat = stop.get("lat")
+        lng = stop.get("lng")
+        old_name = stop.get("name", "")
+
+        # Only update if current name is coordinates
+        if old_name.startswith("Stop at"):
+            # Get new place name
+            new_name = schedule_generator._get_location_name(lat, lng)
+            stop["name"] = new_name
+
+            if not new_name.startswith("Stop at"):
+                updates_made += 1
+
+        updated_stops.append(stop)
+
+    # Update route in database
+    routes_collection.update_one(
+        {"route_id": route_id},
+        {"$set": {"intermediate_stops": updated_stops}}
+    )
+
+    return {
+        "message": "Route place names updated successfully",
+        "route_id": route_id,
+        "total_stops": len(updated_stops),
+        "updates_made": updates_made,
+        "intermediate_stops": updated_stops
+    }
+
+
+@router.post("/routes/update-all-place-names")
+async def update_all_routes_place_names():
+    """
+    Update ALL routes' intermediate stops with proper place names
+    This is useful after fixing the geocoding system
+    """
+    routes_collection = mongodb.get_collection("routes")
+
+    # Get all routes
+    routes = list(routes_collection.find({}))
+
+    total_routes = len(routes)
+    updated_routes = 0
+    total_updates = 0
+
+    for route in routes:
+        route_id = route.get("route_id")
+
+        # Check if route has intermediate_stops
+        if "intermediate_stops" not in route or not route["intermediate_stops"]:
+            continue
+
+        intermediate_stops = route["intermediate_stops"]
+        updated_stops = []
+        route_updates = 0
+
+        # Update each stop
+        for stop in intermediate_stops:
+            lat = stop.get("lat")
+            lng = stop.get("lng")
+            old_name = stop.get("name", "")
+
+            # Only update if current name is coordinates
+            if old_name.startswith("Stop at"):
+                # Get new place name
+                new_name = schedule_generator._get_location_name(lat, lng)
+                stop["name"] = new_name
+
+                if not new_name.startswith("Stop at"):
+                    route_updates += 1
+                    total_updates += 1
+
+            updated_stops.append(stop)
+
+        # Update route in database if changes were made
+        if route_updates > 0:
+            routes_collection.update_one(
+                {"route_id": route_id},
+                {"$set": {"intermediate_stops": updated_stops}}
+            )
+            updated_routes += 1
+
+    return {
+        "message": "All routes updated successfully",
+        "total_routes": total_routes,
+        "routes_updated": updated_routes,
+        "total_place_names_updated": total_updates
     }
 
